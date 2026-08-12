@@ -39,6 +39,7 @@ limitations under the License.
 #include "core/layers/common/linear.h"
 #include "core/layers/common/rms_norm.h"
 #include "models/dit/utils/dit_parallel_linear.h"
+#include "models/dit/utils/dit_parallel_mixin.h"
 #include "models/dit/utils/sparse_attention.h"
 #include "models/dit/utils/util.h"
 
@@ -83,6 +84,16 @@ inline torch::Tensor wan_apply_rotary_emb(const torch::Tensor& hidden_states,
 #endif
 }
 
+// Pads the sequence dim to a multiple of the SP world size, keeping the rotary
+// tables in lockstep. Restored from the pre-mixin implementation so that the
+// numerics match bit-for-bit: the pad tokens stay in the sequence through RoPE
+// and attention, exactly as before the refactor.
+//
+// Because this runs before SequenceParallelMixin::sequence_parallel_forward,
+// the length the mixin sees is already divisible by sp_size, so the padding it
+// records is always 0 and its own pad_tensor/unpad_tensor become no-ops. The
+// mixin keeps providing the scatter/gather structure; the padding semantics are
+// the original ones.
 inline int64_t sp_pad_sequence(
     torch::Tensor& hidden_states,
     torch::Tensor& freqs_cos,
@@ -546,14 +557,17 @@ class WanPixArtAlphaTextProjectionImpl : public torch::nn::Module {
 };
 TORCH_MODULE(WanPixArtAlphaTextProjection);
 
-class WanAttentionImpl : public torch::nn::Module {
+class WanAttentionImpl : public torch::nn::Module,
+                         public xllm::dit::SequenceParallelMixin {
  public:
   explicit WanAttentionImpl(
       const ModelContext& context,
       const ParallelArgs& parallel_args,
       int64_t cross_attention_dim_head = -1,
       const xllm::dit::SparseAttnConfig& sparse_attn_config = {})
-      : options_(context.get_tensor_options()),
+      : xllm::dit::SequenceParallelMixin(
+            /*process_group=*/parallel_args.dit_sp_group_),
+        options_(context.get_tensor_options()),
         parallel_args_(parallel_args),
         sparse_attn_config_(sparse_attn_config) {
     auto model_args = context.get_model_args();
@@ -832,6 +846,9 @@ class WanAttentionImpl : public torch::nn::Module {
     }
 
     // ── Step 4: Reshape → RoPE → Attention → to_out ──
+    // No unpadding here: sp_pad_sequence() padded the sequence and the rotary
+    // tables together before the SP scatter, so the pad tokens ride through
+    // RoPE and attention just as they did before the mixin refactor.
     query = query.view({batch_size, -1, n_heads, dim_head_});
     key = key.view({batch_size, -1, n_heads, dim_head_});
     value = value.view({batch_size, -1, n_heads, dim_head_});
@@ -878,6 +895,7 @@ class WanAttentionImpl : public torch::nn::Module {
     if (hidden_states_img.defined()) {
       hidden_states = hidden_states + hidden_states_img;
     }
+    // No re-padding needed: the sequence never lost its SP padding above.
     if (::xllm::ParallelConfig::get_instance().sp_size() > 1) {
       hidden_states = sp_all_to_all_reverse(
           hidden_states,
@@ -1473,12 +1491,15 @@ class WanTransformerBlockImpl : public torch::nn::Module {
 };
 TORCH_MODULE(WanTransformerBlock);
 
-class WanTransformer3DModelImpl : public torch::nn::Module {
+class WanTransformer3DModelImpl : public torch::nn::Module,
+                                  public xllm::dit::SequenceParallelMixin {
  public:
   explicit WanTransformer3DModelImpl(
       const ModelContext& context,
       const xllm::dit::SparseAttnConfig& sparse_attn_config = {})
-      : options_(context.get_tensor_options()) {
+      : xllm::dit::SequenceParallelMixin(
+            /*process_group=*/context.get_parallel_args().dit_sp_group_),
+        options_(context.get_tensor_options()) {
     auto model_args = context.get_model_args();
     auto parallel_args = context.get_parallel_args();
     sp_group_ = parallel_args.dit_sp_group_;
@@ -1579,6 +1600,9 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
         hidden_states.to(patch_embedding_->weight.dtype()));
     hidden_states = hidden_states.flatten(2).transpose(1, 2);
 
+    // Pad the sequence (and the rotary tables) up front, before the mixin's
+    // scatter. This keeps the numerics identical to the pre-refactor path and
+    // leaves the mixin's own padding bookkeeping at 0.
     int64_t seq_len = hidden_states.size(1);
     int64_t pad_seq_len = sp_pad_sequence(
         hidden_states, freqs_cos, freqs_sin, rotary_emb, sp_group_);
@@ -1616,34 +1640,47 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
                      1);
     }
 
-    if (::xllm::ParallelConfig::get_instance().sp_size() > 1) {
-      hidden_states =
-          dit::sp_split_sequence(hidden_states, /*dim=*/1, sp_group_);
-      if (timestep_proj.dim() == 4) {
-        timestep_proj =
-            dit::sp_split_sequence(timestep_proj, /*dim=*/1, sp_group_);
-      }
+    // Sequence parallelism: scatter the sequence-shaped inputs, run the
+    // transformer blocks on the local shard, then gather back. The mixin
+    // wrapper keeps scatter/gather structurally paired — an asymmetric
+    // early-return here would desynchronise the SP collectives and hang HCCL
+    // (see the FBCache all-reduce note in dit_cache_impl.cpp).
+    xllm::dit::SequenceParallelTensorMap sp_inputs{
+        {"hidden_states", {hidden_states, /*sequence_dim=*/1}}};
+    // timestep_proj only carries a sequence dim in the 4-D (per-token) layout;
+    // the 3-D broadcast layout must stay unsharded.
+    const bool shard_timestep_proj = timestep_proj.dim() == 4;
+    if (shard_timestep_proj) {
+      sp_inputs["timestep_proj"] = {timestep_proj, /*sequence_dim=*/1};
     }
 
-    for (int64_t i = 0; i < transformer_layers_.size(); ++i) {
-      if (before_layer_cb) {
-        before_layer_cb(static_cast<int32_t>(i));
-      }
-      hidden_states =
-          transformer_layers_[i]->forward(hidden_states,
-                                          encoder_hidden_states_embedded,
-                                          timestep_proj,
-                                          rotary_emb,
-                                          sparse_attn_state);
-      if (after_layer_cb) {
-        after_layer_cb(static_cast<int32_t>(i));
-      }
-    }
+    xllm::dit::SequenceParallelTensorMap sp_outputs = sequence_parallel_forward(
+        sp_inputs,
+        [this,
+         &encoder_hidden_states_embedded,
+         &timestep_proj,
+         &rotary_emb,
+         &sparse_attn_state,
+         &before_layer_cb,
+         &after_layer_cb,
+         shard_timestep_proj](
+            const xllm::dit::SequenceParallelTensorMap& sp_locals) {
+          const torch::Tensor& local_timestep_proj =
+              shard_timestep_proj ? sp_locals.at("timestep_proj").first
+                                  : timestep_proj;
+          torch::Tensor local_hidden_states =
+              forward_impl(sp_locals.at("hidden_states").first,
+                           encoder_hidden_states_embedded,
+                           local_timestep_proj,
+                           rotary_emb,
+                           sparse_attn_state,
+                           before_layer_cb,
+                           after_layer_cb);
+          return xllm::dit::SequenceParallelTensorMap{
+              {"hidden_states", {local_hidden_states, /*sequence_dim=*/1}}};
+        });
 
-    if (::xllm::ParallelConfig::get_instance().sp_size() > 1) {
-      hidden_states =
-          dit::sp_gather_sequence(hidden_states, /*dim=*/1, sp_group_);
-    }
+    hidden_states = sp_outputs.at("hidden_states").first;
 
     torch::Tensor shift, scale;
     if (temb.dim() == 3) {
@@ -1672,6 +1709,8 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
                                            scale_2d.to(hidden_states_dtype),
                                            shift_2d.to(hidden_states_dtype));
 
+    // De-pad here, after ada_norm_out, matching the pre-refactor order.
+    // gather_sequence() trimmed nothing because the padding it recorded was 0.
     if (::xllm::ParallelConfig::get_instance().sp_size() > 1 &&
         seq_len != pad_seq_len) {
       hidden_states = hidden_states.slice(1, 0, seq_len);
@@ -1687,6 +1726,35 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
                                         -1});
     hidden_states = hidden_states.permute({0, 7, 1, 4, 2, 5, 3, 6});
     hidden_states = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3);
+    return hidden_states;
+  }
+
+  // Runs the transformer blocks on this rank's sequence shard. Called through
+  // SequenceParallelMixin::sequence_parallel_forward, so the inputs are already
+  // scattered and the return value is gathered by the wrapper.
+  torch::Tensor forward_impl(
+      const torch::Tensor& local_hidden_states,
+      const torch::Tensor& encoder_hidden_states_embedded,
+      const torch::Tensor& local_timestep_proj,
+      std::pair<torch::Tensor, torch::Tensor>& rotary_emb,
+      xllm::dit::SparseAttnState& sparse_attn_state,
+      const std::function<void(int32_t)>& before_layer_cb,
+      const std::function<void(int32_t)>& after_layer_cb) {
+    torch::Tensor hidden_states = local_hidden_states;
+    for (int64_t i = 0; i < transformer_layers_.size(); ++i) {
+      if (before_layer_cb) {
+        before_layer_cb(static_cast<int32_t>(i));
+      }
+      hidden_states =
+          transformer_layers_[i]->forward(hidden_states,
+                                          encoder_hidden_states_embedded,
+                                          local_timestep_proj,
+                                          rotary_emb,
+                                          sparse_attn_state);
+      if (after_layer_cb) {
+        after_layer_cb(static_cast<int32_t>(i));
+      }
+    }
     return hidden_states;
   }
 
